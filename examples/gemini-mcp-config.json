@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "salesforce-account-engagement": {
+      "transport": "stdio",
+      "command": "salesforce-account-engagement-mcp",
+      "args": [],
+      "env": {
+        "AE_READ_ONLY": "true",
+        "PARDOT_BUSINESS_UNIT_ID": "0UvXXXXXXXXXXXXXXX",
+        "SF_CLIENT_ID": "YOUR_EXTERNAL_CLIENT_APP_ID",
+        "SF_LOGIN_URL": "https://login.salesforce.com",
+        "PARDOT_API_BASE_URL": "https://pi.pardot.com"
+      },
+      "notes": [
+        "Gemini MCP host support varies by product surface.",
+        "Prefer stdio when the host launches local processes.",
+        "For remote Gemini connectors that support Streamable HTTP, use the chatgpt-remote-mcp.json pattern with an HTTPS endpoint."
+      ]
+    }
+  }
+}

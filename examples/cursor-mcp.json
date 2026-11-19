@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "salesforce-account-engagement": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/PATH/TO/salesforce-account-management-mcp",
+        "run",
+        "salesforce-account-engagement-mcp"
+      ],
+      "env": {
+        "AE_READ_ONLY": "true",
+        "PARDOT_BUSINESS_UNIT_ID": "0UvXXXXXXXXXXXXXXX",
+        "SF_CLIENT_ID": "YOUR_EXTERNAL_CLIENT_APP_ID",
+        "SF_LOGIN_URL": "https://login.salesforce.com",
+        "PARDOT_API_BASE_URL": "https://pi.pardot.com",
+        "SF_TOKEN_STORE_PATH": "/PATH/TO/salesforce-account-management-mcp/.ae_tokens/tokens.json"
+      }
+    }
+  }
+}

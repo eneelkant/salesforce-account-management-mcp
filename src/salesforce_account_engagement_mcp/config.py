@@ -54,6 +54,28 @@ class Settings(BaseSettings):
     mcp_host: str = Field(default="127.0.0.1", alias="MCP_HOST")
     mcp_port: int = Field(default=8000, alias="MCP_PORT")
 
+    # Streamable HTTP auth (fail-closed when transport=streamable-http)
+    # bearer: clients send Authorization: Bearer <MCP_HTTP_BEARER_TOKEN>
+    # proxy: authenticated reverse proxy injects Authorization: Bearer <MCP_HTTP_PROXY_SHARED_SECRET>
+    mcp_http_auth_mode: Literal["", "bearer", "proxy"] = Field(
+        default="",
+        alias="MCP_HTTP_AUTH_MODE",
+    )
+    mcp_http_bearer_token: str = Field(default="", alias="MCP_HTTP_BEARER_TOKEN")
+    mcp_http_proxy_shared_secret: str = Field(
+        default="",
+        alias="MCP_HTTP_PROXY_SHARED_SECRET",
+    )
+    # Optional: public MCP URL for protected-resource metadata / audience checks
+    mcp_http_resource_url: str = Field(default="", alias="MCP_HTTP_RESOURCE_URL")
+    mcp_http_issuer_url: str = Field(default="", alias="MCP_HTTP_ISSUER_URL")
+
+    # OAuth scope override (default: least-privilege pardot_api + refresh_token)
+    sf_oauth_scopes: str = Field(
+        default="pardot_api refresh_token",
+        alias="SF_OAUTH_SCOPES",
+    )
+
     # Security
     ae_read_only: bool = Field(default=True, alias="AE_READ_ONLY")
     ae_allow_create: bool = Field(default=False, alias="AE_ALLOW_CREATE")

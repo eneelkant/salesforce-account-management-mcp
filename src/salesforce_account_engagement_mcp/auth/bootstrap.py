@@ -100,9 +100,16 @@ def validate_redirect_uri(redirect_uri: str) -> tuple[str, int, str]:
 
     Only plain HTTP loopback URIs are supported. HTTPS is rejected unless a
     local TLS certificate/key pair is configured (not implemented in bootstrap —
-    use HTTP loopback instead).
+    use HTTP loopback instead). Query strings and fragments are rejected.
     """
-    parsed = urlparse(redirect_uri)
+    if not isinstance(redirect_uri, str) or not redirect_uri.strip():
+        raise OAuthError("SF_REDIRECT_URI must be a non-empty HTTP loopback URL.")
+
+    try:
+        parsed = urlparse(redirect_uri)
+    except ValueError as exc:
+        raise OAuthError(f"SF_REDIRECT_URI is malformed and could not be parsed: {exc}") from exc
+
     if parsed.scheme == "https":
         raise OAuthError(
             "SF_REDIRECT_URI uses https://, but the local OAuth bootstrap callback "
@@ -111,28 +118,62 @@ def validate_redirect_uri(redirect_uri: str) -> tuple[str, int, str]:
         )
     if parsed.scheme != "http":
         raise OAuthError(
-            f"Unsupported SF_REDIRECT_URI scheme '{parsed.scheme}'. "
+            f"Unsupported SF_REDIRECT_URI scheme '{parsed.scheme or '(empty)'}'. "
             "Only http://127.0.0.1 or http://localhost loopback URIs are supported."
         )
-    if parsed.username or parsed.password:
-        raise OAuthError("SF_REDIRECT_URI must not include username/password credentials.")
-    host = parsed.hostname or ""
+    if parsed.query:
+        raise OAuthError(
+            "SF_REDIRECT_URI must not include a query string. "
+            "Use a bare path such as http://127.0.0.1:8765/oauth/callback."
+        )
+    if parsed.fragment:
+        raise OAuthError(
+            "SF_REDIRECT_URI must not include a URL fragment (#...). "
+            "Use a bare path such as http://127.0.0.1:8765/oauth/callback."
+        )
+
+    netloc = parsed.netloc or ""
+    if "@" in netloc or parsed.username is not None or parsed.password is not None:
+        raise OAuthError(
+            "SF_REDIRECT_URI must not include username/password credentials "
+            "or a malformed authority containing '@'."
+        )
+
+    # Hostname / port: urlparse raises ValueError for non-numeric ports; also
+    # catch incomplete authorities (missing host).
+    try:
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError as exc:
+        raise OAuthError(f"SF_REDIRECT_URI has a malformed port or authority: {exc}") from exc
+
+    if not host:
+        raise OAuthError(
+            "SF_REDIRECT_URI is missing a hostname. "
+            "Expected http://127.0.0.1:<port>/oauth/callback."
+        )
     if host not in _LOOPBACK_HOSTS:
         raise OAuthError(
             f"SF_REDIRECT_URI host '{host}' is not a loopback address. "
             "Only localhost, 127.0.0.1, or ::1 are allowed for the local callback server."
         )
-    if parsed.port is None:
+    if port is None:
         raise OAuthError(
             "SF_REDIRECT_URI must include an explicit port "
             "(for example http://127.0.0.1:8765/oauth/callback)."
         )
+    if not (1 <= int(port) <= 65535):
+        raise OAuthError(
+            f"SF_REDIRECT_URI port {port} is out of range. Use a port between 1 and 65535."
+        )
+
     path = parsed.path or "/oauth/callback"
     if not path.startswith("/"):
         raise OAuthError("SF_REDIRECT_URI path must start with '/'.")
+
     # Bind address: map localhost to 127.0.0.1 for IPv4 listener predictability.
     bind_host = "127.0.0.1" if host in {"localhost", "127.0.0.1"} else host
-    return bind_host, int(parsed.port), path
+    return bind_host, int(port), path
 
 
 # Backwards-compatible alias used by older call sites / tests.
@@ -145,8 +186,12 @@ class OAuthCallbackServer:
     Lifecycle:
     1. ``start()`` binds the socket and begins serving in a background thread.
     2. Callers wait on ``ready`` before opening the browser (eliminates race).
-    3. ``wait()`` blocks until a valid/invalid callback is handled or timeout.
+    3. ``wait()`` blocks until a terminal callback is handled or timeout.
     4. ``stop()`` shuts the server down.
+
+    Only a valid (code + matching CSRF state) or IdP ``error=`` response is
+    terminal. Incomplete / wrong-state requests are rejected without completing
+    auth. A previously accepted valid callback is never overwritten.
     """
 
     def __init__(self, *, host: str, port: int, path: str, expected_state: str) -> None:
@@ -158,6 +203,8 @@ class OAuthCallbackServer:
         self._done = threading.Event()
         self._lock = threading.Lock()
         self._result = CallbackResult()
+        self._accepted = False  # True once a valid code+state is locked in
+        self._terminal_error = False  # True once an IdP error= is locked in
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -172,6 +219,7 @@ class OAuthCallbackServer:
                     self.end_headers()
                     self.wfile.write(b"Not found")
                     return
+
                 params = parse_qs(parsed.query)
 
                 def _first(name: str) -> str | None:
@@ -180,37 +228,64 @@ class OAuthCallbackServer:
                         return None
                     return values[0]
 
-                with outer._lock:
-                    outer._result = CallbackResult(
-                        code=_first("code"),
-                        state=_first("state"),
-                        error=_first("error"),
-                        error_description=_first("error_description"),
-                    )
-                    result = outer._result
+                code = _first("code")
+                state = _first("state")
+                error = _first("error")
+                error_description = _first("error_description")
 
-                if result.error:
-                    body = f"OAuth error: {result.error} {result.error_description or ''}".encode()
-                    status = 400
-                elif not result.code:
-                    body = b"Missing authorization code"
-                    status = 400
-                elif result.state != outer.expected_state:
-                    body = b"Invalid OAuth state (CSRF check failed)"
-                    status = 400
-                    with outer._lock:
-                        outer._result.error = "invalid_state"
-                        outer._result.error_description = "state mismatch"
-                else:
-                    body = b"Authentication complete. You can close this window."
-                    status = 200
+                signal_done = False
+                status = 400
+                body = b"Invalid OAuth callback"
+
+                with outer._lock:
+                    # Never overwrite a previously accepted valid callback.
+                    if outer._accepted:
+                        status = 200
+                        body = b"Authentication already completed. You can close this window."
+                    elif outer._terminal_error:
+                        status = 400
+                        body = b"OAuth already failed. Restart login."
+                    elif error:
+                        # IdP reported an error — terminal failure, do not auth.
+                        outer._result = CallbackResult(
+                            code=None,
+                            state=state,
+                            error=error,
+                            error_description=error_description,
+                        )
+                        outer._terminal_error = True
+                        signal_done = True
+                        status = 400
+                        body = f"OAuth error: {error} {error_description or ''}".encode()
+                    elif not code or not state:
+                        # Incomplete — reject without completing the wait so a
+                        # later valid redirect can still succeed.
+                        status = 400
+                        body = b"Incomplete OAuth callback (missing code or state)"
+                    elif state != outer.expected_state:
+                        # CSRF mismatch — reject without completing auth / wait.
+                        status = 400
+                        body = b"Invalid OAuth state (CSRF check failed)"
+                    else:
+                        # Valid authorization code + CSRF state.
+                        outer._result = CallbackResult(
+                            code=code,
+                            state=state,
+                            error=None,
+                            error_description=None,
+                        )
+                        outer._accepted = True
+                        signal_done = True
+                        status = 200
+                        body = b"Authentication complete. You can close this window."
 
                 self.send_response(status)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                outer._done.set()
+                if signal_done:
+                    outer._done.set()
 
             def log_message(self, format: str, *args: object) -> None:
                 logger.debug("oauth-callback: " + format, *args)
@@ -251,11 +326,13 @@ class OAuthCallbackServer:
                 error=self._result.error,
                 error_description=self._result.error_description,
             )
-        if result.error:
+            accepted = self._accepted
+            terminal_error = self._terminal_error
+        if result.error or terminal_error:
             raise OAuthError(
                 f"OAuth callback error: {result.error} ({result.error_description or ''})"
             )
-        if not result.code or result.state != self.expected_state:
+        if not accepted or not result.code or result.state != self.expected_state:
             raise OAuthError("OAuth callback failed state/code validation.")
         return result
 

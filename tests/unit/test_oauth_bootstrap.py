@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
@@ -11,6 +12,7 @@ import pytest
 import respx
 
 from salesforce_account_engagement_mcp.auth.bootstrap import (
+    OAuthCallbackServer,
     PendingPKCE,
     PKCEStore,
     run_authorization_code_bootstrap,
@@ -37,11 +39,12 @@ def test_default_scopes_are_least_privilege() -> None:
     [
         "http://127.0.0.1:8765/oauth/callback",
         "http://localhost:8765/oauth/callback",
+        "http://[::1]:8765/oauth/callback",
     ],
 )
 def test_validate_redirect_accepts_http_loopback(uri: str) -> None:
     host, port, path = validate_redirect_uri(uri)
-    assert host == "127.0.0.1"
+    assert host in {"127.0.0.1", "::1"}
     assert port == 8765
     assert path == "/oauth/callback"
 
@@ -59,10 +62,28 @@ def test_validate_redirect_rejects_external_hosts() -> None:
 
 
 def test_validate_redirect_rejects_credentials_and_missing_port() -> None:
-    with pytest.raises(OAuthError, match=r"username/password|credentials"):
+    with pytest.raises(OAuthError, match=r"username/password|credentials|authority"):
         validate_redirect_uri("http://user:pass@127.0.0.1:8765/oauth/callback")
     with pytest.raises(OAuthError, match=r"explicit port"):
         validate_redirect_uri("http://127.0.0.1/oauth/callback")
+
+
+def test_validate_redirect_rejects_query_and_fragment() -> None:
+    with pytest.raises(OAuthError, match=r"query string"):
+        validate_redirect_uri("http://127.0.0.1:8765/oauth/callback?foo=1")
+    with pytest.raises(OAuthError, match=r"fragment"):
+        validate_redirect_uri("http://127.0.0.1:8765/oauth/callback#section")
+
+
+def test_validate_redirect_rejects_malformed_port_and_authority() -> None:
+    with pytest.raises(OAuthError, match=r"malformed port|authority|could not be parsed"):
+        validate_redirect_uri("http://127.0.0.1:notaport/oauth/callback")
+    with pytest.raises(OAuthError, match=r"out of range|malformed"):
+        validate_redirect_uri("http://127.0.0.1:99999/oauth/callback")
+    with pytest.raises(OAuthError, match=r"missing a hostname|malformed|authority"):
+        validate_redirect_uri("http://:8765/oauth/callback")
+    with pytest.raises(OAuthError, match=r"non-empty|malformed|Unsupported"):
+        validate_redirect_uri("")
 
 
 def test_pkce_store_roundtrip(tmp_path: Path) -> None:
@@ -83,31 +104,67 @@ def test_pkce_store_roundtrip(tmp_path: Path) -> None:
     assert store.load() is None
 
 
-def test_callback_rejects_invalid_state() -> None:
+def test_callback_rejects_invalid_state_without_completing_auth() -> None:
+    """Wrong CSRF state must not complete wait; a later valid callback can succeed."""
     pkce = generate_pkce()
-    host, port, path = "127.0.0.1", 8769, "/oauth/callback"
+    host, port, path = "127.0.0.1", 8780, "/oauth/callback"
 
     def _hit() -> None:
-        url = f"http://{host}:{port}{path}?code=abc&state=WRONG"
+        bad = f"http://{host}:{port}{path}?code=abc&state=WRONG"
         try:
-            urlopen(url, timeout=2)
-        except Exception:
+            urlopen(bad, timeout=2)
+        except HTTPError:
             pass
+        # Valid follow-up after the incomplete/wrong-state reject.
+        good = f"http://{host}:{port}{path}?code=goodcode&state={pkce.state}"
+        urlopen(good, timeout=2)
 
-    with pytest.raises(OAuthError, match=r"state|invalid"):
-        wait_for_oauth_callback(
-            host=host,
-            port=port,
-            path=path,
-            expected_state=pkce.state,
-            timeout_seconds=5,
-            on_ready=_hit,
+    result = wait_for_oauth_callback(
+        host=host,
+        port=port,
+        path=path,
+        expected_state=pkce.state,
+        timeout_seconds=5,
+        on_ready=_hit,
+    )
+    assert result.code == "goodcode"
+    assert result.state == pkce.state
+
+
+def test_callback_incomplete_request_does_not_complete_auth() -> None:
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8781, "/oauth/callback"
+
+    def _hit() -> None:
+        # Missing state — must not complete auth.
+        try:
+            urlopen(f"http://{host}:{port}{path}?code=onlycode", timeout=2)
+        except HTTPError:
+            pass
+        # Missing code — still incomplete.
+        try:
+            urlopen(f"http://{host}:{port}{path}?state={pkce.state}", timeout=2)
+        except HTTPError:
+            pass
+        urlopen(
+            f"http://{host}:{port}{path}?code=final&state={pkce.state}",
+            timeout=2,
         )
+
+    result = wait_for_oauth_callback(
+        host=host,
+        port=port,
+        path=path,
+        expected_state=pkce.state,
+        timeout_seconds=5,
+        on_ready=_hit,
+    )
+    assert result.code == "final"
 
 
 def test_callback_accepts_valid_state() -> None:
     pkce = generate_pkce()
-    host, port, path = "127.0.0.1", 8770, "/oauth/callback"
+    host, port, path = "127.0.0.1", 8782, "/oauth/callback"
 
     def _hit() -> None:
         url = f"http://{host}:{port}{path}?code=authcode&state={pkce.state}"
@@ -125,10 +182,57 @@ def test_callback_accepts_valid_state() -> None:
     assert result.state == pkce.state
 
 
+def test_repeated_callback_does_not_overwrite_accepted_result() -> None:
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8783, "/oauth/callback"
+    server = OAuthCallbackServer(host=host, port=port, path=path, expected_state=pkce.state)
+    server.start()
+    try:
+        assert server.ready.is_set()
+        first = urlopen(
+            f"http://{host}:{port}{path}?code=first-valid&state={pkce.state}",
+            timeout=2,
+        )
+        assert first.status == 200
+        # Second (attacker / duplicate) must not replace the accepted code.
+        second = urlopen(
+            f"http://{host}:{port}{path}?code=attacker-code&state={pkce.state}",
+            timeout=2,
+        )
+        assert second.status == 200
+        result = server.wait(timeout_seconds=2)
+        assert result.code == "first-valid"
+        assert result.state == pkce.state
+    finally:
+        server.stop()
+
+
+def test_idp_error_fails_without_completing_auth() -> None:
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8784, "/oauth/callback"
+
+    def _hit() -> None:
+        url = f"http://{host}:{port}{path}?error=access_denied&error_description=nope"
+        try:
+            urlopen(url, timeout=2)
+        except HTTPError:
+            pass
+
+    with pytest.raises(OAuthError, match=r"access_denied"):
+        wait_for_oauth_callback(
+            host=host,
+            port=port,
+            path=path,
+            expected_state=pkce.state,
+            timeout_seconds=5,
+            on_ready=_hit,
+        )
+
+
 def test_callback_ready_before_immediate_browser_redirect() -> None:
     """Regression: listener must accept connections before on_ready (browser) runs."""
     pkce = generate_pkce()
-    host, port, path = "127.0.0.1", 8772, "/oauth/callback"
+    host, port, path = "127.0.0.1", 8785, "/oauth/callback"
     order: list[str] = []
 
     def _immediate_redirect() -> None:
@@ -149,13 +253,35 @@ def test_callback_ready_before_immediate_browser_redirect() -> None:
     assert order == ["browser"]
 
 
+def test_wrong_path_does_not_complete_auth() -> None:
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8786, "/oauth/callback"
+    server = OAuthCallbackServer(host=host, port=port, path=path, expected_state=pkce.state)
+    server.start()
+    try:
+        try:
+            urlopen(f"http://{host}:{port}/wrong?code=x&state={pkce.state}", timeout=2)
+        except HTTPError as exc:
+            assert exc.code == 404
+        # Wait briefly — wrong path must not set done.
+        assert not server._done.wait(timeout=0.3)
+        urlopen(
+            f"http://{host}:{port}{path}?code=ok&state={pkce.state}",
+            timeout=2,
+        )
+        result = server.wait(timeout_seconds=2)
+        assert result.code == "ok"
+    finally:
+        server.stop()
+
+
 @pytest.mark.asyncio
 async def test_full_bootstrap_flow(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     object.__setattr__(settings, "sf_client_id", "cid")
     object.__setattr__(settings, "sf_client_secret", "sec")
-    object.__setattr__(settings, "sf_redirect_uri", "http://127.0.0.1:8771/oauth/callback")
+    object.__setattr__(settings, "sf_redirect_uri", "http://127.0.0.1:8787/oauth/callback")
     object.__setattr__(settings, "sf_token_store_path", tmp_path / "tokens.json")
     object.__setattr__(settings, "sf_oauth_scopes", "pardot_api refresh_token")
 

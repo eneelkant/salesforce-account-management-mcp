@@ -15,6 +15,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \
     AE_READ_ONLY=true
+# MCP_HTTP_AUTH_MODE + MCP_HTTP_BEARER_TOKEN (or PROXY secret) must be provided at runtime.
+# The process fails closed if Streamable HTTP auth is missing.
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin mcpuser \
     && mkdir -p /app/.ae_tokens \

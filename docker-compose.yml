@@ -9,6 +9,9 @@ services:
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
+      # Required — process refuses to start without HTTP auth (set in .env)
+      # MCP_HTTP_AUTH_MODE: bearer
+      # MCP_HTTP_BEARER_TOKEN: set-in-dotenv
       AE_READ_ONLY: "true"
     read_only: true
     tmpfs:

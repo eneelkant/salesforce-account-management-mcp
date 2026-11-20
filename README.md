@@ -45,12 +45,15 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```bash
 ./scripts/setup.sh
-# edit .env with SF_CLIENT_ID, SF_CLIENT_SECRET, SF_REFRESH_TOKEN, PARDOT_BUSINESS_UNIT_ID
+# edit .env with SF_CLIENT_ID, SF_CLIENT_SECRET, PARDOT_BUSINESS_UNIT_ID, …
 source .venv/bin/activate
-salesforce-account-engagement-mcp
+salesforce-account-engagement-mcp auth login   # Authorization Code + PKCE
+salesforce-account-engagement-mcp serve        # STDIO by default
 ```
 
 Windows: `./scripts/setup.ps1`
+
+Remote Streamable HTTP **requires** MCP bearer/proxy auth (`MCP_HTTP_AUTH_MODE` + secret) and fails closed without it. Salesforce tokens stay server-side.
 
 ## Environment variables
 

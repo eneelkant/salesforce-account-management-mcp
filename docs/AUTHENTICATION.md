@@ -7,16 +7,24 @@ Account Engagement API v5 requires:
 3. An SSO-enabled Salesforce user with Account Engagement access
 4. The correct API host (`pi.pardot.com` or `pi.demo.pardot.com`)
 
+Separately, **remote MCP Streamable HTTP** requires MCP bearer/proxy auth (see [SECURITY.md](SECURITY.md)). That credential is not a Salesforce token.
+
 ## Salesforce External Client App
 
 1. In Salesforce Setup, create an **External Client App** (or Connected App).
 2. Enable OAuth.
-3. Callback URL example: `http://localhost:8765/oauth/callback`
-4. Selected OAuth scopes must include:
-   - **Manage Pardot services** (`pardot_api`)
-   - **Perform requests at any time** / refresh token (`refresh_token` / offline access)
-   - Additional scopes only if required by your org policy
+3. Callback URL example: `http://127.0.0.1:8765/oauth/callback` (must match `SF_REDIRECT_URI`)
+4. Selected OAuth scopes (least privilege):
+   - **Manage Pardot services** (`pardot_api`) — required
+   - **Perform requests at any time** / refresh token (`refresh_token`) — required for refresh
+   - Do **not** enable the broad Salesforce `api` scope unless your org explicitly needs Salesforce REST/SOAP beyond Account Engagement. Override only via `SF_OAUTH_SCOPES` if required.
 5. Capture Consumer Key (`SF_CLIENT_ID`) and Consumer Secret (`SF_CLIENT_SECRET`).
+
+Default requested scopes:
+
+```env
+SF_OAUTH_SCOPES=pardot_api refresh_token
+```
 
 ## Business Unit ID
 
@@ -33,22 +41,49 @@ Account Engagement API v5 requires:
 | AE Developer Org | `https://login.salesforce.com` | `https://pi.demo.pardot.com` |
 | My Domain | `https://YOURDOMAIN.my.salesforce.com` | as appropriate |
 
-## Supported flows
+## OAuth bootstrap (Authorization Code + PKCE)
 
-- Authorization Code + PKCE (`SalesforceOAuthClient.build_authorization_url` / `exchange_code`)
+Preferred first-time login (local callback on localhost only):
+
+```bash
+# Requires SF_CLIENT_ID, SF_CLIENT_SECRET, SF_REDIRECT_URI, SF_LOGIN_URL
+salesforce-account-engagement-mcp auth login
+# or:
+salesforce-account-engagement-mcp auth login --no-browser --timeout 300
+```
+
+What this does:
+
+1. Generates PKCE `code_verifier` / S256 `code_challenge` and CSRF `state`
+2. Persists pending PKCE state to `.ae_tokens/pkce_pending.json` (`0600`)
+3. Prints (and optionally opens) the Salesforce authorize URL
+4. Starts a one-shot localhost callback server matching `SF_REDIRECT_URI`
+5. Validates `state`, exchanges `code` + `code_verifier`, deletes the pending PKCE file
+6. Persists access/refresh tokens to `SF_TOKEN_STORE_PATH`
+
+## Other supported flows
+
 - Refresh-token grant with locked refresh (no concurrent refresh races)
-- Optional bootstrap via `SF_ACCESS_TOKEN` / `SF_REFRESH_TOKEN` env vars
+- Optional bootstrap via `SF_ACCESS_TOKEN` / `SF_REFRESH_TOKEN` env vars (still prefer `auth login`)
 
 Tokens are stored atomically in `SF_TOKEN_STORE_PATH` (default `.ae_tokens/tokens.json`) with `0600` permissions when the OS allows it.
 
-## Request headers
+## Account Engagement request headers
 
 ```http
-Authorization: Bearer <access_token>
+Authorization: Bearer <salesforce_access_token>
 Pardot-Business-Unit-Id: 0Uv...
 Accept: application/json
 Content-Type: application/json
 X-Return-Api-Usage: true
 ```
+
+## Remote MCP client headers (Streamable HTTP)
+
+```http
+Authorization: Bearer <MCP_HTTP_BEARER_TOKEN or MCP_HTTP_PROXY_SHARED_SECRET>
+```
+
+Never send Salesforce refresh/access tokens as the MCP HTTP credential.
 
 Never commit tokens, client secrets, or production Business Unit credentials.

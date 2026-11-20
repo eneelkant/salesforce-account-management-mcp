@@ -13,7 +13,12 @@ from ..config import Settings
 from ..logging_config import get_logger
 from .base import build_ae_headers, extract_api_usage, raise_for_ae_response
 from .errors import AuthenticationRequiredError
-from .pagination import MAX_PAGINATION_RECORDS, merge_pages, validate_next_page_url
+from .pagination import (
+    MAX_PAGINATION_RECORDS,
+    extract_next_page_token,
+    merge_pages,
+    validate_next_page_url,
+)
 from .retry import with_retries
 
 logger = get_logger(__name__)
@@ -171,54 +176,81 @@ class AccountEngagementClient:
 
         pages: list[dict[str, Any]] = []
         token = next_page_token
+        follow_url: str | None = None
         fetched = 0
+        hit_hard_ceiling = False
 
         while True:
-            params: dict[str, Any] = {"fields": field_str}
-            if token:
-                # With page tokens only `fields` (+ token) are valid.
-                params["nextPageToken"] = token
+            if follow_url:
+                # Convenience nextPageUrl already encodes fields + nextPageToken.
+                # Only follow after host/scheme/path validation — never arbitrary URLs.
+                raw = await self.request("GET", follow_url)
+                follow_url = None
             else:
-                params["limit"] = min(limit, max_records - fetched or limit)
-                if order_by:
-                    params["orderBy"] = order_by
-                if filters:
-                    for key, value in filters.items():
-                        if value is not None:
-                            params[key] = value
+                params: dict[str, Any] = {"fields": field_str}
+                if token:
+                    # With page tokens only `fields` (+ nextPageToken) are valid.
+                    params["nextPageToken"] = token
+                else:
+                    params["limit"] = min(limit, max_records - fetched or limit)
+                    if order_by:
+                        params["orderBy"] = order_by
+                    if filters:
+                        for key, value in filters.items():
+                            if value is not None:
+                                params[key] = value
+                url = self.object_url(collection)
+                raw = await self.request("GET", url, params=params)
 
-            url = self.object_url(collection)
-            raw = await self.request("GET", url, params=params)
             page = raw if isinstance(raw, dict) else {"values": raw or []}
             pages.append(page)
             values = page.get("values") or []
             fetched += len(values) if isinstance(values, list) else 0
 
+            warning = str(page.get("_pardot_warning") or "")
+            if "Record count for nextPageToken sequence has been exceeded" in warning:
+                hit_hard_ceiling = True
+
             if not auto_paginate:
                 break
-            if fetched >= max_records:
-                break
-            next_token = page.get("nextPageToken")
-            next_url = page.get("nextPageUrl")
-            if not next_token and not next_url:
-                break
-            if next_url:
-                validate_next_page_url(str(next_url), self.settings.allowed_api_hosts)
-            token = str(next_token) if next_token else None
-            if not token:
+            if fetched >= max_records or hit_hard_ceiling:
                 break
 
-        if auto_paginate and len(pages) > 1:
-            return merge_pages(pages, max_records=max_records)
-        if len(pages) == 1:
+            # Prefer the documented nextPageToken continuation (fields + token only).
+            explicit_token = page.get("nextPageToken")
+            next_url = page.get("nextPageUrl")
+            if explicit_token:
+                token = str(explicit_token)
+                follow_url = None
+                continue
+
+            if not next_url:
+                break
+
+            # Convenience nextPageUrl only when an explicit token is absent.
+            safe_url = validate_next_page_url(
+                str(next_url),
+                self.settings.allowed_api_hosts,
+            )
+            if not safe_url:
+                break
+            token = None
+            follow_url = safe_url
+
+        if len(pages) == 1 and not auto_paginate:
             page = pages[0]
             values = page.get("values") or []
             return {
                 **page,
                 "count": len(values) if isinstance(values, list) else 0,
+                "nextPageToken": extract_next_page_token(page),
                 "data_source": "salesforce_account_engagement_api_v5",
             }
-        return merge_pages(pages, max_records=max_records)
+        return merge_pages(
+            pages,
+            max_records=max_records,
+            hit_hard_ceiling=hit_hard_ceiling,
+        )
 
     async def read(
         self,

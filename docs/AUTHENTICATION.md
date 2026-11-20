@@ -62,6 +62,10 @@ What this does:
 5. Validates `state`, exchanges `code` + `code_verifier`, deletes the pending PKCE file
 6. Persists access/refresh tokens to `SF_TOKEN_STORE_PATH`
 
+CLI errors and logs surface only a sanitized OAuth **error category** (for example
+`access_denied`). Salesforce / IdP `error_description` text is never raised,
+printed, or logged — it may contain sensitive provider detail.
+
 ## Other supported flows
 
 - Refresh-token grant with locked refresh (no concurrent refresh races)

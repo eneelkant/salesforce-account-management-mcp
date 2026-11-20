@@ -221,7 +221,7 @@ def test_idp_error_with_valid_state_terminates_auth() -> None:
         except HTTPError:
             pass
 
-    with pytest.raises(OAuthError, match=r"access_denied"):
+    with pytest.raises(OAuthError, match=r"access_denied") as exc_info:
         wait_for_oauth_callback(
             host=host,
             port=port,
@@ -230,6 +230,67 @@ def test_idp_error_with_valid_state_terminates_auth() -> None:
             timeout_seconds=5,
             on_ready=_hit,
         )
+    assert "nope" not in str(exc_info.value)
+
+
+def test_idp_error_description_never_raised_even_with_secrets() -> None:
+    """Regression: wait()/CLI must never surface raw IdP error_description."""
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8791, "/oauth/callback"
+    leak = (
+        "access_token=ATOKEN refresh_token=RTOKEN client_secret=CSECRET "
+        "authorization code=AUTHCODE code_verifier=VERIFIER"
+    )
+
+    def _hit() -> None:
+        from urllib.parse import quote
+
+        url = (
+            f"http://{host}:{port}{path}"
+            f"?error=access_denied&error_description={quote(leak)}"
+            f"&state={pkce.state}"
+        )
+        try:
+            urlopen(url, timeout=2)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            for needle in (
+                "ATOKEN",
+                "RTOKEN",
+                "CSECRET",
+                "AUTHCODE",
+                "VERIFIER",
+                "access_token",
+                "refresh_token",
+                "client_secret",
+                leak,
+            ):
+                assert needle not in body
+
+    with pytest.raises(OAuthError) as exc_info:
+        wait_for_oauth_callback(
+            host=host,
+            port=port,
+            path=path,
+            expected_state=pkce.state,
+            timeout_seconds=5,
+            on_ready=_hit,
+        )
+    message = str(exc_info.value)
+    assert "access_denied" in message
+    for needle in (
+        "ATOKEN",
+        "RTOKEN",
+        "CSECRET",
+        "AUTHCODE",
+        "VERIFIER",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "error_description",
+        leak,
+    ):
+        assert needle not in message
 
 
 def test_idp_error_missing_state_does_not_terminate_session() -> None:
@@ -282,6 +343,70 @@ def test_idp_error_incorrect_state_does_not_terminate_session() -> None:
         on_ready=_hit,
     )
     assert result.code == "recovered"
+
+
+def test_cli_error_path_only_surfaces_category() -> None:
+    """Simulate auth login stderr: print(f'error: {exc}') must stay category-only."""
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8792, "/oauth/callback"
+    leak = "refresh_token=SECRET access_token=TOK client_secret=CS"
+
+    def _hit() -> None:
+        from urllib.parse import quote
+
+        try:
+            urlopen(
+                f"http://{host}:{port}{path}?error=access_denied"
+                f"&error_description={quote(leak)}&state={pkce.state}",
+                timeout=2,
+            )
+        except HTTPError:
+            pass
+
+    with pytest.raises(OAuthError) as exc_info:
+        wait_for_oauth_callback(
+            host=host,
+            port=port,
+            path=path,
+            expected_state=pkce.state,
+            timeout_seconds=5,
+            on_ready=_hit,
+        )
+    cli_line = f"error: {exc_info.value}"
+    assert cli_line == "error: OAuth callback error: access_denied"
+    assert "SECRET" not in cli_line
+    assert "TOK" not in cli_line
+    assert "CS" not in cli_line
+
+
+@pytest.mark.asyncio
+async def test_pkce_pending_cleared_on_callback_failure(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    object.__setattr__(settings, "sf_client_id", "cid")
+    object.__setattr__(settings, "sf_redirect_uri", "http://127.0.0.1:8793/oauth/callback")
+    object.__setattr__(settings, "sf_token_store_path", tmp_path / "tokens.json")
+    pkce_path = tmp_path / "pkce_pending.json"
+
+    def _failing_wait(**_kwargs: object) -> object:
+        raise OAuthError("OAuth callback error: access_denied")
+
+    monkeypatch.setattr(
+        "salesforce_account_engagement_mcp.auth.bootstrap.wait_for_oauth_callback",
+        _failing_wait,
+    )
+    monkeypatch.setattr(
+        "salesforce_account_engagement_mcp.auth.bootstrap.webbrowser.open",
+        lambda *_a, **_k: False,
+    )
+    with pytest.raises(OAuthError, match=r"access_denied"):
+        await run_authorization_code_bootstrap(
+            settings,
+            open_browser=False,
+            timeout_seconds=1,
+            pkce_store_path=pkce_path,
+        )
+    assert not pkce_path.exists()
 
 
 def test_valid_callback_after_invalid_error_callback() -> None:

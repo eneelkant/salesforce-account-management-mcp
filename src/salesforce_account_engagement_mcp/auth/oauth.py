@@ -200,28 +200,50 @@ def parse_token_response(payload: dict[str, Any]) -> OAuthTokens:
     )
 
 
+# RFC 6749 / common Salesforce OAuth error codes we are willing to surface.
+_SAFE_OAUTH_ERROR_CATEGORIES = frozenset(
+    {
+        "access_denied",
+        "invalid_request",
+        "invalid_scope",
+        "server_error",
+        "temporarily_unavailable",
+        "unauthorized_client",
+        "unsupported_response_type",
+        "invalid_client",
+        "invalid_grant",
+        "unsupported_grant_type",
+        "invalid_token",
+        "interaction_required",
+        "login_required",
+    }
+)
+
+
+def oauth_error_category(error: str | None) -> str:
+    """Map an IdP ``error`` code to a safe, loggable category.
+
+    Never returns ``error_description``, tokens, query strings, or other IdP text.
+    Unknown or malformed codes collapse to ``oauth_error``.
+    """
+    if not error or not isinstance(error, str):
+        return "oauth_error"
+    cleaned = "".join(ch for ch in error.strip().lower() if ch.isalnum() or ch in {"_", "-"})
+    cleaned = cleaned[:64]
+    if cleaned in _SAFE_OAUTH_ERROR_CATEGORIES:
+        return cleaned
+    return "oauth_error"
+
+
 def _safe_error_body(response: httpx.Response) -> str:
-    """Return a redacted OAuth error summary — never echo tokens or raw bodies."""
+    """Return a category-only OAuth error summary — never echo descriptions or bodies."""
     try:
         body = response.json()
         if isinstance(body, dict):
-            err = body.get("error")
-            desc = body.get("error_description")
-            parts = [str(part) for part in (err, desc) if part]
-            if parts:
-                text = ": ".join(parts)[:200]
-                lowered = text.lower()
-                for marker in (
-                    "access_token",
-                    "refresh_token",
-                    "client_secret",
-                    "authorization_code",
-                    "code_verifier",
-                ):
-                    if marker in lowered:
-                        return f"oauth_error_redacted (http_{response.status_code})"
-                return text
+            category = oauth_error_category(
+                str(body["error"]) if body.get("error") is not None else None
+            )
+            return f"{category} (http_{response.status_code})"
     except Exception:
         logger.debug("Unable to parse OAuth error body as JSON", exc_info=False)
-    # Prefer status over raw HTML/text bodies which may echo request fragments.
     return f"http_{response.status_code}"

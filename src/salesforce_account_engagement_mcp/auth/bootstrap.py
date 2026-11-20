@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ..config import Settings
 from ..logging_config import get_logger
-from .oauth import OAuthError, SalesforceOAuthClient, generate_pkce
+from .oauth import OAuthError, SalesforceOAuthClient, generate_pkce, oauth_error_category
 from .token_manager import TokenManager
 from .token_store import TokenStore
 
@@ -233,7 +233,9 @@ class OAuthCallbackServer:
                 code = _first("code")
                 state = _first("state")
                 error = _first("error")
-                error_description = _first("error_description")
+                # IdP error_description is intentionally ignored — never store,
+                # log, raise, or print provider description text (may contain
+                # secrets or sensitive strings).
 
                 signal_done = False
                 status = 400
@@ -254,18 +256,17 @@ class OAuthCallbackServer:
                             status = 400
                             body = b"Invalid OAuth error callback (missing or mismatched state)"
                         else:
+                            category = oauth_error_category(error)
                             outer._result = CallbackResult(
                                 code=None,
                                 state=state,
-                                error=error,
-                                error_description=error_description,
+                                error=category,
+                                error_description=None,
                             )
                             outer._terminal_error = True
                             signal_done = True
                             status = 400
-                            # Do not echo raw IdP descriptions that may be noisy;
-                            # keep the stable error code for the browser page.
-                            body = f"OAuth error: {error}".encode()
+                            body = f"OAuth error: {category}".encode()
                     elif not code or not state:
                         # Incomplete — reject without completing the wait so a
                         # later valid redirect can still succeed.
@@ -339,9 +340,9 @@ class OAuthCallbackServer:
             accepted = self._accepted
             terminal_error = self._terminal_error
         if result.error or terminal_error:
-            raise OAuthError(
-                f"OAuth callback error: {result.error} ({result.error_description or ''})"
-            )
+            # Category only — never raise raw IdP error_description / secrets.
+            category = oauth_error_category(result.error)
+            raise OAuthError(f"OAuth callback error: {category}")
         if not accepted or not result.code or result.state != self.expected_state:
             raise OAuthError("OAuth callback failed state/code validation.")
         return result

@@ -59,23 +59,61 @@ def test_token_store_atomic_roundtrip(tmp_path: Path) -> None:
 
 
 def test_oauth_error_body_does_not_echo_secrets() -> None:
-    from salesforce_account_engagement_mcp.auth.oauth import _safe_error_body
+    from salesforce_account_engagement_mcp.auth.oauth import (
+        _safe_error_body,
+        oauth_error_category,
+    )
 
     response = httpx.Response(
         400,
         json={
             "error": "invalid_grant",
-            "error_description": "expired authorization code",
+            "error_description": ("expired access_token=LEAK refresh_token=R client_secret=S"),
             "access_token": "should-not-leak",
         },
     )
     detail = _safe_error_body(response)
-    assert "should-not-leak" not in detail
-    assert "access_token" not in detail.lower() or "redacted" in detail.lower()
+    assert detail == "invalid_grant (http_400)"
+    for needle in (
+        "should-not-leak",
+        "LEAK",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "expired",
+    ):
+        assert needle not in detail
 
     raw = httpx.Response(500, text="<html>access_token=leak</html>")
     assert "leak" not in _safe_error_body(raw)
     assert _safe_error_body(raw) == "http_500"
+    assert oauth_error_category("access_denied") == "access_denied"
+    assert oauth_error_category("not_a_real_error") == "oauth_error"
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_error_raises_category_only() -> None:
+    client = SalesforceOAuthClient(
+        client_id="cid",
+        redirect_uri="http://127.0.0.1:8765/oauth/callback",
+    )
+    with respx.mock:
+        respx.post("https://login.salesforce.com/services/oauth2/token").mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "access_token=LEAKED client_secret=SEC",
+                },
+            )
+        )
+        with pytest.raises(OAuthError) as exc_info:
+            await client.exchange_code(code="bad", code_verifier="verifier")
+    message = str(exc_info.value)
+    assert "invalid_grant" in message
+    assert "LEAKED" not in message
+    assert "client_secret" not in message
+    assert "access_token" not in message
 
 
 def test_pkce_uses_s256_and_crypto_random_state() -> None:

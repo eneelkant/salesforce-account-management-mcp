@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
@@ -15,6 +14,7 @@ from salesforce_account_engagement_mcp.auth.bootstrap import (
     PendingPKCE,
     PKCEStore,
     run_authorization_code_bootstrap,
+    validate_redirect_uri,
     wait_for_oauth_callback,
 )
 from salesforce_account_engagement_mcp.auth.oauth import (
@@ -30,6 +30,39 @@ def test_default_scopes_are_least_privilege() -> None:
     assert "pardot_api" in DEFAULT_SCOPES
     assert "refresh_token" in DEFAULT_SCOPES
     assert " api" not in f" {DEFAULT_SCOPES} "
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://127.0.0.1:8765/oauth/callback",
+        "http://localhost:8765/oauth/callback",
+    ],
+)
+def test_validate_redirect_accepts_http_loopback(uri: str) -> None:
+    host, port, path = validate_redirect_uri(uri)
+    assert host == "127.0.0.1"
+    assert port == 8765
+    assert path == "/oauth/callback"
+
+
+def test_validate_redirect_rejects_https_without_local_tls() -> None:
+    with pytest.raises(OAuthError, match=r"https://.*TLS|HTTP loopback"):
+        validate_redirect_uri("https://127.0.0.1:8765/oauth/callback")
+
+
+def test_validate_redirect_rejects_external_hosts() -> None:
+    with pytest.raises(OAuthError, match=r"loopback|not a loopback"):
+        validate_redirect_uri("http://example.com:8765/oauth/callback")
+    with pytest.raises(OAuthError, match=r"loopback|not a loopback"):
+        validate_redirect_uri("http://10.0.0.5:8765/oauth/callback")
+
+
+def test_validate_redirect_rejects_credentials_and_missing_port() -> None:
+    with pytest.raises(OAuthError, match=r"username/password|credentials"):
+        validate_redirect_uri("http://user:pass@127.0.0.1:8765/oauth/callback")
+    with pytest.raises(OAuthError, match=r"explicit port"):
+        validate_redirect_uri("http://127.0.0.1/oauth/callback")
 
 
 def test_pkce_store_roundtrip(tmp_path: Path) -> None:
@@ -55,16 +88,12 @@ def test_callback_rejects_invalid_state() -> None:
     host, port, path = "127.0.0.1", 8769, "/oauth/callback"
 
     def _hit() -> None:
-        import time
-
-        time.sleep(0.2)
         url = f"http://{host}:{port}{path}?code=abc&state=WRONG"
         try:
             urlopen(url, timeout=2)
         except Exception:
             pass
 
-    threading.Thread(target=_hit, daemon=True).start()
     with pytest.raises(OAuthError, match=r"state|invalid"):
         wait_for_oauth_callback(
             host=host,
@@ -72,6 +101,7 @@ def test_callback_rejects_invalid_state() -> None:
             path=path,
             expected_state=pkce.state,
             timeout_seconds=5,
+            on_ready=_hit,
         )
 
 
@@ -80,22 +110,43 @@ def test_callback_accepts_valid_state() -> None:
     host, port, path = "127.0.0.1", 8770, "/oauth/callback"
 
     def _hit() -> None:
-        import time
-
-        time.sleep(0.2)
         url = f"http://{host}:{port}{path}?code=authcode&state={pkce.state}"
         urlopen(url, timeout=2)
 
-    threading.Thread(target=_hit, daemon=True).start()
     result = wait_for_oauth_callback(
         host=host,
         port=port,
         path=path,
         expected_state=pkce.state,
         timeout_seconds=5,
+        on_ready=_hit,
     )
     assert result.code == "authcode"
     assert result.state == pkce.state
+
+
+def test_callback_ready_before_immediate_browser_redirect() -> None:
+    """Regression: listener must accept connections before on_ready (browser) runs."""
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8772, "/oauth/callback"
+    order: list[str] = []
+
+    def _immediate_redirect() -> None:
+        order.append("browser")
+        # No sleep — simulate Salesforce redirecting immediately after authorize.
+        url = f"http://{host}:{port}{path}?code=fast&state={pkce.state}"
+        urlopen(url, timeout=2)
+
+    result = wait_for_oauth_callback(
+        host=host,
+        port=port,
+        path=path,
+        expected_state=pkce.state,
+        timeout_seconds=5,
+        on_ready=_immediate_redirect,
+    )
+    assert result.code == "fast"
+    assert order == ["browser"]
 
 
 @pytest.mark.asyncio
@@ -108,28 +159,20 @@ async def test_full_bootstrap_flow(
     object.__setattr__(settings, "sf_token_store_path", tmp_path / "tokens.json")
     object.__setattr__(settings, "sf_oauth_scopes", "pardot_api refresh_token")
 
-    # Capture authorize URL / state from printed flow by patching generate path via wait
-    # Intercept webbrowser and callback wait internals by firing callback after auth URL built.
-    captured: dict[str, str] = {}
-
     real_wait = wait_for_oauth_callback
 
     def _wait_and_inject(**kwargs: object) -> object:
-        # Extract expected state and simulate browser callback concurrently
         expected_state = str(kwargs["expected_state"])
         host = str(kwargs["host"])
         port = int(kwargs["port"])  # type: ignore[arg-type]
         path = str(kwargs["path"])
-        captured["state"] = expected_state
 
         def _hit() -> None:
-            import time
-
-            time.sleep(0.15)
             url = f"http://{host}:{port}{path}?code=from-sf&state={expected_state}"
             urlopen(url, timeout=2)
 
-        threading.Thread(target=_hit, daemon=True).start()
+        # Preserve ready-before-browser contract from production code.
+        kwargs = {**kwargs, "on_ready": _hit}
         return real_wait(**kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
@@ -169,7 +212,6 @@ async def test_full_bootstrap_flow(
     assert result["ok"] is True
     assert (tmp_path / "tokens.json").exists()
     assert not (tmp_path / "pkce_pending.json").exists()
-    # Authorize URL should request least-privilege scopes
     client = SalesforceOAuthClient(
         client_id="cid",
         redirect_uri=settings.sf_redirect_uri,

@@ -56,6 +56,43 @@ def test_validate_rejects_http_and_foreign_host() -> None:
         )
 
 
+def test_validate_rejects_userinfo_and_unexpected_port() -> None:
+    allowed = frozenset({"pi.pardot.com"})
+    with pytest.raises(PaginationSafetyError, match=r"username/password|userinfo"):
+        validate_next_page_url(
+            "https://user:pass@pi.pardot.com/api/v5/objects/prospects",
+            allowed,
+        )
+    with pytest.raises(PaginationSafetyError, match=r"unexpected port"):
+        validate_next_page_url(
+            "https://pi.pardot.com:8443/api/v5/objects/prospects",
+            allowed,
+        )
+
+
+def test_validate_requires_exact_v5_objects_path() -> None:
+    allowed = frozenset({"pi.pardot.com"})
+    with pytest.raises(PaginationSafetyError, match=r"exact Account Engagement"):
+        validate_next_page_url("https://pi.pardot.com/api/v5/query", allowed)
+    with pytest.raises(PaginationSafetyError, match=r"exact Account Engagement"):
+        validate_next_page_url("https://pi.pardot.com/api/v4/objects/prospects", allowed)
+    # Valid exact paths still accepted
+    assert (
+        validate_next_page_url(
+            "https://pi.pardot.com/api/v5/objects/prospects?fields=id&nextPageToken=x",
+            allowed,
+        )
+        is not None
+    )
+    assert (
+        validate_next_page_url(
+            "https://pi.demo.pardot.com/api/v5/objects/list-memberships/12",
+            frozenset({"pi.demo.pardot.com"}),
+        )
+        is not None
+    )
+
+
 @pytest.mark.asyncio
 async def test_auto_paginate_with_next_page_token(runtime: AppRuntime) -> None:
     with respx.mock:

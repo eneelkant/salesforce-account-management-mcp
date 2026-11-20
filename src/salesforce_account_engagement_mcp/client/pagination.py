@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -11,11 +12,17 @@ from .errors import PaginationSafetyError
 PAGE_TOKEN_TTL_HOURS = 4
 MAX_PAGINATION_RECORDS = 100_000
 
+# Exact AE API v5 objects collection path (optional object id / do-action suffix).
+_AE_V5_OBJECTS_PATH = re.compile(
+    r"^/api/v5/objects/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+(?:/do/[A-Za-z0-9_-]+)?)?/?$"
+)
+
 
 def validate_next_page_url(url: str | None, allowed_hosts: frozenset[str]) -> str | None:
-    """Validate nextPageUrl scheme/host/path before following it with OAuth credentials.
+    """Validate nextPageUrl before following it with OAuth credentials.
 
-    Returns the URL if safe, None if empty, or raises PaginationSafetyError.
+    Requires HTTPS, allowlisted host, default HTTPS port only, no userinfo, and an
+    exact Account Engagement API v5 objects path.
     """
     if not url:
         return None
@@ -26,6 +33,20 @@ def validate_next_page_url(url: str | None, allowed_hosts: frozenset[str]) -> st
             status_code=400,
             code="unsafe_next_page_url",
         )
+    if parsed.username is not None or parsed.password is not None:
+        raise PaginationSafetyError(
+            "Refusing nextPageUrl that embeds username/password credentials.",
+            status_code=400,
+            code="unsafe_next_page_url",
+        )
+    # Also catch userinfo forms that urlparse may leave in netloc for odd inputs.
+    netloc = parsed.netloc or ""
+    if "@" in netloc:
+        raise PaginationSafetyError(
+            "Refusing nextPageUrl with userinfo ('@') in the authority.",
+            status_code=400,
+            code="unsafe_next_page_url",
+        )
     host = parsed.hostname or ""
     if host not in allowed_hosts:
         raise PaginationSafetyError(
@@ -33,10 +54,19 @@ def validate_next_page_url(url: str | None, allowed_hosts: frozenset[str]) -> st
             status_code=400,
             code="unsafe_next_page_url",
         )
-    path = parsed.path or ""
-    if "/api/v5/" not in path:
+    # HTTPS must use the default port (443) or omit the port — no unexpected ports.
+    if parsed.port is not None and parsed.port != 443:
         raise PaginationSafetyError(
-            "Refusing nextPageUrl that is not an Account Engagement API v5 path.",
+            f"Refusing nextPageUrl with unexpected port {parsed.port} "
+            "(HTTPS default port 443 only).",
+            status_code=400,
+            code="unsafe_next_page_url",
+        )
+    path = parsed.path or ""
+    if not _AE_V5_OBJECTS_PATH.match(path):
+        raise PaginationSafetyError(
+            "Refusing nextPageUrl that is not an exact Account Engagement "
+            "API v5 objects path (/api/v5/objects/...).",
             status_code=400,
             code="unsafe_next_page_url",
         )

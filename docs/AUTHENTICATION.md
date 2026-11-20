@@ -13,7 +13,8 @@ Separately, **remote MCP Streamable HTTP** requires MCP bearer/proxy auth (see [
 
 1. In Salesforce Setup, create an **External Client App** (or Connected App).
 2. Enable OAuth.
-3. Callback URL example: `http://127.0.0.1:8765/oauth/callback` (must match `SF_REDIRECT_URI`)
+3. Callback URL example: `http://127.0.0.1:8765/oauth/callback` (must match `SF_REDIRECT_URI`).  
+   Local bootstrap accepts **HTTP loopback only** (`127.0.0.1` / `localhost` / `::1` with an explicit port). HTTPS redirect URIs are rejected unless you terminate TLS yourself outside this callback server.
 4. Selected OAuth scopes (least privilege):
    - **Manage Pardot services** (`pardot_api`) — required
    - **Perform requests at any time** / refresh token (`refresh_token`) — required for refresh

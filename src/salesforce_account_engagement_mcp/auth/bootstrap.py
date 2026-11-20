@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
-import secrets
 import threading
 import webbrowser
 from dataclasses import asdict, dataclass
@@ -21,6 +21,8 @@ from .token_manager import TokenManager
 from .token_store import TokenStore
 
 logger = get_logger(__name__)
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 @dataclass
@@ -93,18 +95,185 @@ class CallbackResult:
     error_description: str | None = None
 
 
-def _parse_redirect(redirect_uri: str) -> tuple[str, int, str]:
+def validate_redirect_uri(redirect_uri: str) -> tuple[str, int, str]:
+    """Validate SF_REDIRECT_URI for the local bootstrap callback server.
+
+    Only plain HTTP loopback URIs are supported. HTTPS is rejected unless a
+    local TLS certificate/key pair is configured (not implemented in bootstrap —
+    use HTTP loopback instead).
+    """
     parsed = urlparse(redirect_uri)
-    if parsed.scheme not in {"http", "https"}:
-        raise OAuthError(f"Unsupported redirect URI scheme: {parsed.scheme}")
-    host = parsed.hostname or "127.0.0.1"
-    if host not in {"127.0.0.1", "localhost", "::1"}:
+    if parsed.scheme == "https":
         raise OAuthError(
-            f"OAuth bootstrap callback server only binds to localhost/127.0.0.1. Got host '{host}'."
+            "SF_REDIRECT_URI uses https://, but the local OAuth bootstrap callback "
+            "server does not ship with TLS certificates. Use an HTTP loopback URI "
+            "such as http://127.0.0.1:8765/oauth/callback (or http://localhost:8765/...)."
         )
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme != "http":
+        raise OAuthError(
+            f"Unsupported SF_REDIRECT_URI scheme '{parsed.scheme}'. "
+            "Only http://127.0.0.1 or http://localhost loopback URIs are supported."
+        )
+    if parsed.username or parsed.password:
+        raise OAuthError("SF_REDIRECT_URI must not include username/password credentials.")
+    host = parsed.hostname or ""
+    if host not in _LOOPBACK_HOSTS:
+        raise OAuthError(
+            f"SF_REDIRECT_URI host '{host}' is not a loopback address. "
+            "Only localhost, 127.0.0.1, or ::1 are allowed for the local callback server."
+        )
+    if parsed.port is None:
+        raise OAuthError(
+            "SF_REDIRECT_URI must include an explicit port "
+            "(for example http://127.0.0.1:8765/oauth/callback)."
+        )
     path = parsed.path or "/oauth/callback"
-    return host, port, path
+    if not path.startswith("/"):
+        raise OAuthError("SF_REDIRECT_URI path must start with '/'.")
+    # Bind address: map localhost to 127.0.0.1 for IPv4 listener predictability.
+    bind_host = "127.0.0.1" if host in {"localhost", "127.0.0.1"} else host
+    return bind_host, int(parsed.port), path
+
+
+# Backwards-compatible alias used by older call sites / tests.
+_parse_redirect = validate_redirect_uri
+
+
+class OAuthCallbackServer:
+    """Thread-safe one-shot localhost OAuth callback listener.
+
+    Lifecycle:
+    1. ``start()`` binds the socket and begins serving in a background thread.
+    2. Callers wait on ``ready`` before opening the browser (eliminates race).
+    3. ``wait()`` blocks until a valid/invalid callback is handled or timeout.
+    4. ``stop()`` shuts the server down.
+    """
+
+    def __init__(self, *, host: str, port: int, path: str, expected_state: str) -> None:
+        self.host = host
+        self.port = port
+        self.path = path
+        self.expected_state = expected_state
+        self.ready = threading.Event()
+        self._done = threading.Event()
+        self._lock = threading.Lock()
+        self._result = CallbackResult()
+        self._server: HTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                if parsed.path != outer.path:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Not found")
+                    return
+                params = parse_qs(parsed.query)
+
+                def _first(name: str) -> str | None:
+                    values = params.get(name)
+                    if not values:
+                        return None
+                    return values[0]
+
+                with outer._lock:
+                    outer._result = CallbackResult(
+                        code=_first("code"),
+                        state=_first("state"),
+                        error=_first("error"),
+                        error_description=_first("error_description"),
+                    )
+                    result = outer._result
+
+                if result.error:
+                    body = f"OAuth error: {result.error} {result.error_description or ''}".encode()
+                    status = 400
+                elif not result.code:
+                    body = b"Missing authorization code"
+                    status = 400
+                elif result.state != outer.expected_state:
+                    body = b"Invalid OAuth state (CSRF check failed)"
+                    status = 400
+                    with outer._lock:
+                        outer._result.error = "invalid_state"
+                        outer._result.error_description = "state mismatch"
+                else:
+                    body = b"Authentication complete. You can close this window."
+                    status = 200
+
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                outer._done.set()
+
+            def log_message(self, format: str, *args: object) -> None:
+                logger.debug("oauth-callback: " + format, *args)
+
+        # Bind before marking ready so an immediate browser redirect cannot race.
+        try:
+            server = HTTPServer((self.host, self.port), Handler)
+        except OSError as exc:
+            raise OAuthError(
+                f"Unable to bind OAuth callback server on {self.host}:{self.port}: {exc}"
+            ) from exc
+        self._server = server
+
+        def _serve() -> None:
+            assert self._server is not None
+            # Socket is already bound by HTTPServer.__init__; signal readiness
+            # before entering the accept loop so callers may open the browser.
+            self.ready.set()
+            self._server.serve_forever(poll_interval=0.2)
+
+        self._thread = threading.Thread(target=_serve, name="ae-oauth-callback", daemon=True)
+        self._thread.start()
+        if not self.ready.wait(timeout=5.0):
+            self.stop()
+            raise OAuthError("OAuth callback server failed to become ready.")
+
+    def wait(self, timeout_seconds: float) -> CallbackResult:
+        finished = self._done.wait(timeout=timeout_seconds)
+        if not finished:
+            raise OAuthError(
+                f"Timed out after {timeout_seconds:.0f}s waiting for OAuth callback on "
+                f"{self.host}:{self.port}{self.path}."
+            )
+        with self._lock:
+            result = CallbackResult(
+                code=self._result.code,
+                state=self._result.state,
+                error=self._result.error,
+                error_description=self._result.error_description,
+            )
+        if result.error:
+            raise OAuthError(
+                f"OAuth callback error: {result.error} ({result.error_description or ''})"
+            )
+        if not result.code or result.state != self.expected_state:
+            raise OAuthError("OAuth callback failed state/code validation.")
+        return result
+
+    def stop(self) -> None:
+        self._done.set()
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+            except Exception:
+                logger.debug("OAuth callback server shutdown raised", exc_info=False)
+            try:
+                self._server.server_close()
+            except Exception:
+                logger.debug("OAuth callback server close raised", exc_info=False)
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
 
 
 def wait_for_oauth_callback(
@@ -114,72 +283,26 @@ def wait_for_oauth_callback(
     path: str,
     expected_state: str,
     timeout_seconds: float = 300.0,
+    on_ready: Any | None = None,
 ) -> CallbackResult:
-    """Run a one-shot local HTTP callback server and validate CSRF state."""
-    result = CallbackResult()
-    done = threading.Event()
+    """Start a ready-gated localhost callback server, then wait for the redirect.
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path != path:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Not found")
-                return
-            params = parse_qs(parsed.query)
-
-            def _first(name: str) -> str | None:
-                values = params.get(name)
-                if not values:
-                    return None
-                return values[0]
-
-            result.code = _first("code")
-            result.state = _first("state")
-            result.error = _first("error")
-            result.error_description = _first("error_description")
-
-            if result.error:
-                body = f"OAuth error: {result.error} {result.error_description or ''}".encode()
-                self.send_response(400)
-            elif not result.code:
-                body = b"Missing authorization code"
-                self.send_response(400)
-            elif result.state != expected_state:
-                body = b"Invalid OAuth state (CSRF check failed)"
-                self.send_response(400)
-                result.error = "invalid_state"
-                result.error_description = "state mismatch"
-            else:
-                body = b"Authentication complete. You can close this window."
-                self.send_response(200)
-
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            done.set()
-
-        def log_message(self, format: str, *args: object) -> None:
-            logger.debug("oauth-callback: " + format, *args)
-
-    server = HTTPServer((host, port), Handler)
-    thread = threading.Thread(target=server.handle_request, daemon=True)
-    thread.start()
-    finished = done.wait(timeout=timeout_seconds)
-    server.server_close()
-    thread.join(timeout=5)
-    if not finished:
-        raise OAuthError(
-            f"Timed out after {timeout_seconds:.0f}s waiting for OAuth callback on "
-            f"{host}:{port}{path}."
-        )
-    if result.error:
-        raise OAuthError(f"OAuth callback error: {result.error} ({result.error_description or ''})")
-    if not result.code or result.state != expected_state:
-        raise OAuthError("OAuth callback failed state/code validation.")
-    return result
+    ``on_ready`` is invoked only after the listener is accepting connections —
+    use it to open the browser so an immediate redirect cannot race the bind.
+    """
+    server = OAuthCallbackServer(
+        host=host,
+        port=port,
+        path=path,
+        expected_state=expected_state,
+    )
+    try:
+        server.start()
+        if on_ready is not None:
+            on_ready()
+        return server.wait(timeout_seconds)
+    finally:
+        server.stop()
 
 
 async def run_authorization_code_bootstrap(
@@ -201,8 +324,6 @@ async def run_authorization_code_bootstrap(
         scopes=settings.sf_oauth_scopes,
     )
     pkce = generate_pkce()
-    # Extra entropy binding for local pending file identity
-    _ = secrets.token_hex(8)
 
     store_path = pkce_store_path or (
         Path(settings.sf_token_store_path).parent / "pkce_pending.json"
@@ -218,19 +339,22 @@ async def run_authorization_code_bootstrap(
     )
     pkce_store.save(pending)
 
-    host, port, path = _parse_redirect(settings.sf_redirect_uri)
+    host, port, path = validate_redirect_uri(settings.sf_redirect_uri)
     auth_url = oauth.build_authorization_url(pkce)
     logger.info("Starting local OAuth callback server on %s:%s%s", host, port, path)
     print("Open this URL to authorize Salesforce Account Engagement access:\n")
     print(auth_url)
     print()
-    if open_browser:
+
+    def _open_browser() -> None:
+        if not open_browser:
+            return
         try:
             webbrowser.open(auth_url)
         except Exception:
             logger.debug("Unable to open system browser", exc_info=False)
 
-    # Blocking callback wait in a worker thread so this coroutine stays async-friendly.
+    # Listener is started and verified ready *before* on_ready opens the browser.
     callback = await asyncio.to_thread(
         wait_for_oauth_callback,
         host=host,
@@ -238,6 +362,7 @@ async def run_authorization_code_bootstrap(
         path=path,
         expected_state=pkce.state,
         timeout_seconds=timeout_seconds,
+        on_ready=_open_browser,
     )
 
     loaded = pkce_store.load()
@@ -273,6 +398,4 @@ async def run_authorization_code_bootstrap(
 
 
 def hmac_compare(a: str, b: str) -> bool:
-    import hmac
-
     return hmac.compare_digest(a, b)

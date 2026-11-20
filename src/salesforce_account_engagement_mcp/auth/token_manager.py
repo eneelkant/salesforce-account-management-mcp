@@ -39,6 +39,7 @@ class TokenManager:
                 client_secret=settings.sf_client_secret,
                 redirect_uri=settings.sf_redirect_uri,
                 login_url=settings.sf_login_url,
+                scopes=settings.sf_oauth_scopes,
             )
             if settings.has_oauth_client()
             else None

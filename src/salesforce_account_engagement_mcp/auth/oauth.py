@@ -16,8 +16,10 @@ from ..logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Scopes required for Account Engagement API access
-DEFAULT_SCOPES = "pardot_api refresh_token api"
+# Least-privilege scopes for Account Engagement API access.
+# `pardot_api` is required. `refresh_token` enables offline refresh.
+# Broad Salesforce `api` is intentionally omitted by default (override via SF_OAUTH_SCOPES).
+DEFAULT_SCOPES = "pardot_api refresh_token"
 
 
 class OAuthError(RuntimeError):

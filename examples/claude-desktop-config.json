@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "salesforce-account-engagement": {
+      "command": "python",
+      "args": [
+        "-m",
+        "salesforce_account_engagement_mcp"
+      ],
+      "cwd": "/PATH/TO/salesforce-account-management-mcp",
+      "env": {
+        "AE_READ_ONLY": "true",
+        "PARDOT_BUSINESS_UNIT_ID": "0UvXXXXXXXXXXXXXXX",
+        "SF_CLIENT_ID": "YOUR_EXTERNAL_CLIENT_APP_ID",
+        "SF_REFRESH_TOKEN": "SET_VIA_LOCAL_ENV_NOT_COMMITTED",
+        "SF_LOGIN_URL": "https://login.salesforce.com",
+        "PARDOT_API_BASE_URL": "https://pi.pardot.com"
+      }
+    }
+  }
+}

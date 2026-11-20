@@ -1,0 +1,27 @@
+{
+  "name": "salesforce-account-engagement",
+  "transport": "streamable-http",
+  "url": "https://YOUR_PUBLIC_HOST/mcp",
+  "headers": {
+    "Authorization": "Bearer YOUR_MCP_HTTP_BEARER_TOKEN"
+  },
+  "notes": [
+    "Deploy with MCP_TRANSPORT=streamable-http behind HTTPS.",
+    "MCP_HTTP_AUTH_MODE=bearer (or proxy) is required; the server fails closed without it.",
+    "Authorization header authenticates the MCP client — it is NOT a Salesforce token.",
+    "Do not put Salesforce client secrets or refresh tokens in ChatGPT connector headers.",
+    "Authenticate the MCP host to Salesforce using server-side refresh tokens / auth login.",
+    "Keep AE_READ_ONLY=true unless write access is explicitly required."
+  ],
+  "example_docker": {
+    "image": "salesforce-account-engagement-mcp:latest",
+    "env": [
+      "MCP_TRANSPORT=streamable-http",
+      "MCP_HOST=0.0.0.0",
+      "MCP_PORT=8000",
+      "MCP_HTTP_AUTH_MODE=bearer",
+      "MCP_HTTP_BEARER_TOKEN=YOUR_MCP_HTTP_BEARER_TOKEN",
+      "AE_READ_ONLY=true"
+    ]
+  }
+}

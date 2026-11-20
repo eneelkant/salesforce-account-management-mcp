@@ -1,0 +1,26 @@
+services:
+  ae-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      # Required — process refuses to start without HTTP auth (set in .env)
+      # MCP_HTTP_AUTH_MODE: bearer
+      # MCP_HTTP_BEARER_TOKEN: set-in-dotenv
+      AE_READ_ONLY: "true"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ae_tokens:/app/.ae_tokens
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  ae_tokens:

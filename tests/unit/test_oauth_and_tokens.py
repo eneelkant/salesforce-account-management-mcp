@@ -54,6 +54,42 @@ def test_token_store_atomic_roundtrip(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.access_token == "a"
     assert loaded.refresh_token == "b"
+    mode = store.path.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_oauth_error_body_does_not_echo_secrets() -> None:
+    from salesforce_account_engagement_mcp.auth.oauth import _safe_error_body
+
+    response = httpx.Response(
+        400,
+        json={
+            "error": "invalid_grant",
+            "error_description": "expired authorization code",
+            "access_token": "should-not-leak",
+        },
+    )
+    detail = _safe_error_body(response)
+    assert "should-not-leak" not in detail
+    assert "access_token" not in detail.lower() or "redacted" in detail.lower()
+
+    raw = httpx.Response(500, text="<html>access_token=leak</html>")
+    assert "leak" not in _safe_error_body(raw)
+    assert _safe_error_body(raw) == "http_500"
+
+
+def test_pkce_uses_s256_and_crypto_random_state() -> None:
+    import base64
+    import hashlib
+
+    pkce = generate_pkce()
+    digest = hashlib.sha256(pkce.code_verifier.encode("ascii")).digest()
+    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    assert pkce.code_challenge == expected
+    # Distinct crypto-random state values across calls.
+    other = generate_pkce()
+    assert pkce.state != other.state
+    assert len(pkce.state) >= 16
 
 
 @pytest.mark.asyncio

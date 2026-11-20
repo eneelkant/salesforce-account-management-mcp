@@ -201,11 +201,27 @@ def parse_token_response(payload: dict[str, Any]) -> OAuthTokens:
 
 
 def _safe_error_body(response: httpx.Response) -> str:
+    """Return a redacted OAuth error summary — never echo tokens or raw bodies."""
     try:
         body = response.json()
         if isinstance(body, dict):
-            return str(body.get("error_description") or body.get("error") or body)
+            err = body.get("error")
+            desc = body.get("error_description")
+            parts = [str(part) for part in (err, desc) if part]
+            if parts:
+                text = ": ".join(parts)[:200]
+                lowered = text.lower()
+                for marker in (
+                    "access_token",
+                    "refresh_token",
+                    "client_secret",
+                    "authorization_code",
+                    "code_verifier",
+                ):
+                    if marker in lowered:
+                        return f"oauth_error_redacted (http_{response.status_code})"
+                return text
     except Exception:
         logger.debug("Unable to parse OAuth error body as JSON", exc_info=False)
-    text = response.text[:200]
-    return text or "unknown error"
+    # Prefer status over raw HTML/text bodies which may echo request fragments.
+    return f"http_{response.status_code}"

@@ -76,10 +76,19 @@ class TokenStore:
             suffix=".tmp",
         )
         try:
+            # Restrict temp file before writing secrets (mkstemp may inherit umask).
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            try:
+                os.chmod(tmp_name, 0o600)
+            except OSError:
+                pass
             os.replace(tmp_name, self.path)
             try:
                 os.chmod(self.path, 0o600)

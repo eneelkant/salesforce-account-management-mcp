@@ -207,12 +207,15 @@ def test_repeated_callback_does_not_overwrite_accepted_result() -> None:
         server.stop()
 
 
-def test_idp_error_fails_without_completing_auth() -> None:
+def test_idp_error_with_valid_state_terminates_auth() -> None:
     pkce = generate_pkce()
     host, port, path = "127.0.0.1", 8784, "/oauth/callback"
 
     def _hit() -> None:
-        url = f"http://{host}:{port}{path}?error=access_denied&error_description=nope"
+        url = (
+            f"http://{host}:{port}{path}"
+            f"?error=access_denied&error_description=nope&state={pkce.state}"
+        )
         try:
             urlopen(url, timeout=2)
         except HTTPError:
@@ -227,6 +230,83 @@ def test_idp_error_fails_without_completing_auth() -> None:
             timeout_seconds=5,
             on_ready=_hit,
         )
+
+
+def test_idp_error_missing_state_does_not_terminate_session() -> None:
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8788, "/oauth/callback"
+
+    def _hit() -> None:
+        bad = f"http://{host}:{port}{path}?error=access_denied&error_description=nope"
+        try:
+            urlopen(bad, timeout=2)
+        except HTTPError:
+            pass
+        urlopen(
+            f"http://{host}:{port}{path}?code=after-bad-error&state={pkce.state}",
+            timeout=2,
+        )
+
+    result = wait_for_oauth_callback(
+        host=host,
+        port=port,
+        path=path,
+        expected_state=pkce.state,
+        timeout_seconds=5,
+        on_ready=_hit,
+    )
+    assert result.code == "after-bad-error"
+
+
+def test_idp_error_incorrect_state_does_not_terminate_session() -> None:
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8789, "/oauth/callback"
+
+    def _hit() -> None:
+        bad = f"http://{host}:{port}{path}?error=access_denied&state=WRONG_STATE"
+        try:
+            urlopen(bad, timeout=2)
+        except HTTPError:
+            pass
+        urlopen(
+            f"http://{host}:{port}{path}?code=recovered&state={pkce.state}",
+            timeout=2,
+        )
+
+    result = wait_for_oauth_callback(
+        host=host,
+        port=port,
+        path=path,
+        expected_state=pkce.state,
+        timeout_seconds=5,
+        on_ready=_hit,
+    )
+    assert result.code == "recovered"
+
+
+def test_valid_callback_after_invalid_error_callback() -> None:
+    """Regression: invalid error= must not block a later valid success."""
+    pkce = generate_pkce()
+    host, port, path = "127.0.0.1", 8790, "/oauth/callback"
+    server = OAuthCallbackServer(host=host, port=port, path=path, expected_state=pkce.state)
+    server.start()
+    try:
+        try:
+            urlopen(
+                f"http://{host}:{port}{path}?error=access_denied",
+                timeout=2,
+            )
+        except HTTPError:
+            pass
+        assert not server._done.is_set()
+        urlopen(
+            f"http://{host}:{port}{path}?code=ok-after-error&state={pkce.state}",
+            timeout=2,
+        )
+        result = server.wait(timeout_seconds=2)
+        assert result.code == "ok-after-error"
+    finally:
+        server.stop()
 
 
 def test_callback_ready_before_immediate_browser_redirect() -> None:

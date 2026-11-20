@@ -189,9 +189,11 @@ class OAuthCallbackServer:
     3. ``wait()`` blocks until a terminal callback is handled or timeout.
     4. ``stop()`` shuts the server down.
 
-    Only a valid (code + matching CSRF state) or IdP ``error=`` response is
-    terminal. Incomplete / wrong-state requests are rejected without completing
-    auth. A previously accepted valid callback is never overwritten.
+    Only a valid (code + matching CSRF state) or an IdP ``error=`` response
+    that also carries the matching CSRF ``state`` is terminal. Incomplete,
+    malformed, duplicate, or wrong-state requests (including error callbacks
+    without valid state) are rejected without completing auth. A previously
+    accepted valid callback is never overwritten.
     """
 
     def __init__(self, *, host: str, port: int, path: str, expected_state: str) -> None:
@@ -246,17 +248,24 @@ class OAuthCallbackServer:
                         status = 400
                         body = b"OAuth already failed. Restart login."
                     elif error:
-                        # IdP reported an error — terminal failure, do not auth.
-                        outer._result = CallbackResult(
-                            code=None,
-                            state=state,
-                            error=error,
-                            error_description=error_description,
-                        )
-                        outer._terminal_error = True
-                        signal_done = True
-                        status = 400
-                        body = f"OAuth error: {error} {error_description or ''}".encode()
+                        # IdP error is terminal only when CSRF state matches.
+                        # Missing/incorrect state must not kill the login session.
+                        if not state or state != outer.expected_state:
+                            status = 400
+                            body = b"Invalid OAuth error callback (missing or mismatched state)"
+                        else:
+                            outer._result = CallbackResult(
+                                code=None,
+                                state=state,
+                                error=error,
+                                error_description=error_description,
+                            )
+                            outer._terminal_error = True
+                            signal_done = True
+                            status = 400
+                            # Do not echo raw IdP descriptions that may be noisy;
+                            # keep the stable error code for the browser page.
+                            body = f"OAuth error: {error}".encode()
                     elif not code or not state:
                         # Incomplete — reject without completing the wait so a
                         # later valid redirect can still succeed.
@@ -288,7 +297,8 @@ class OAuthCallbackServer:
                     outer._done.set()
 
             def log_message(self, format: str, *args: object) -> None:
-                logger.debug("oauth-callback: " + format, *args)
+                # Never log the request line/query — it may contain auth codes.
+                logger.debug("oauth-callback: request handled")
 
         # Bind before marking ready so an immediate browser redirect cannot race.
         try:
@@ -432,30 +442,34 @@ async def run_authorization_code_bootstrap(
             logger.debug("Unable to open system browser", exc_info=False)
 
     # Listener is started and verified ready *before* on_ready opens the browser.
-    callback = await asyncio.to_thread(
-        wait_for_oauth_callback,
-        host=host,
-        port=port,
-        path=path,
-        expected_state=pkce.state,
-        timeout_seconds=timeout_seconds,
-        on_ready=_open_browser,
-    )
+    try:
+        callback = await asyncio.to_thread(
+            wait_for_oauth_callback,
+            host=host,
+            port=port,
+            path=path,
+            expected_state=pkce.state,
+            timeout_seconds=timeout_seconds,
+            on_ready=_open_browser,
+        )
 
-    loaded = pkce_store.load()
-    if loaded is None or loaded.state != pkce.state:
-        pkce_store.clear()
-        raise OAuthError("Pending PKCE state missing or mismatched after callback.")
-    if not hmac_compare(loaded.code_verifier, pkce.code_verifier):
-        pkce_store.clear()
-        raise OAuthError("Pending PKCE verifier mismatch.")
+        loaded = pkce_store.load()
+        if loaded is None or loaded.state != pkce.state:
+            raise OAuthError("Pending PKCE state missing or mismatched after callback.")
+        if not hmac_compare(loaded.code_verifier, pkce.code_verifier):
+            raise OAuthError("Pending PKCE verifier mismatch.")
 
-    assert callback.code is not None
-    tokens = await oauth.exchange_code(
-        code=callback.code,
-        code_verifier=loaded.code_verifier,
-    )
-    pkce_store.clear()
+        assert callback.code is not None
+        tokens = await oauth.exchange_code(
+            code=callback.code,
+            code_verifier=loaded.code_verifier,
+        )
+    except Exception:
+        # Always scrub pending verifier/state on any failure path.
+        pkce_store.clear()
+        raise
+    else:
+        pkce_store.clear()
 
     manager = TokenManager(
         settings,

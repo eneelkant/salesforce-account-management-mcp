@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     sf_client_id: str = Field(default="", alias="SF_CLIENT_ID")
     sf_client_secret: str = Field(default="", alias="SF_CLIENT_SECRET")
     sf_redirect_uri: str = Field(
-        default="http://localhost:8765/oauth/callback",
+        default="http://127.0.0.1:8765/oauth/callback",
         alias="SF_REDIRECT_URI",
     )
     sf_login_url: str = Field(default="https://login.salesforce.com", alias="SF_LOGIN_URL")
